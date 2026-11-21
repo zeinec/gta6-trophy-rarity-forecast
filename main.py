@@ -1,427 +1,393 @@
 #!/usr/bin/env python3
-"""GTA VI trophy rarity forecaster.
+"""GTA VI trophy rarity forecaster — make.fun entry gta6-trophy-rarity-forecast-01.
 
-Forecasts, for every PS5 trophy of Grand Theft Auto VI, the percent of
-Exophase-tracked players who will hold it at the case's target time, as
-five quantiles per trophy. Scored by pinball loss on the logit scale.
+Forecasts every trophy's Exophase earn rate at the case target as five
+quantiles (5/25/50/75/95%), from the house's recorded reads up to the
+checkpoint. Stdlib only, offline, deterministic.
 
-Model (see work/DESIGN.md for the evidence behind it):
+Why this shape: a trophy's rate is holders / players_tracked, and the two
+sides move for different reasons, so they are forecast separately.
+Exophase's page is frozen between its refreshes (hours apart), so the
+history is a step function and only refresh points carry signal. New
+players arrive in a flood after launch and hold almost nothing but the
+intro trophy, so every rate dilutes; the few early trophies (Chapter 1,
+fishing, arcade) recover as the base matures.
 
-  rate(t) = Holders(t) / Players(t), and the two sides are forecast
-  separately, then divided.
+Method, per trophy:
+  1. Collapse the history into refresh points: consecutive reads with
+     identical (players_tracked, rates) are one observation.
+  2. Players N(t): log N against log hours since the New Zealand unlock
+     (2026-11-18T11:00Z). Quadratic inside the observed range; beyond it a
+     damped power law, because a player count cannot turn down the way a
+     concave quadratic would. With fewer than two refresh points, fall
+     back to a launch-calibrated anchor curve (638 @ 12.8 h, 3868 @
+     17.5 h, ~13500 @ 28.3 h).
+  3. Holders H(t): across refreshes, dH = a*dN + b*dt*N_prev, where a is
+     the new cohort's holding probability for the trophy and b the
+     existing base's earn rate. Fit through the origin (least squares),
+     shrunk toward a prior: a0 = last rate x earliness (read from the
+     trophy text — chapter number, activity), b0 a small pooled value
+     by tier. With too few transitions, use the prior outright.
+  4. Median rate = H_target / N_target. Laplace fan on the logit scale
+     with a fatter lower tail (a bigger refresh can only dilute further):
+     widths (1.3, 0.9, 0, 0.9, 0.7), spread from the N-forecast
+     uncertainty plus the holder-fit residual.
+  5. When the history has at least three refresh points, the effective
+     target is pulled earlier by half the median refresh gap (capped at
+     6 h): the graded answer is the state at the last refresh before the
+     target, not the target itself.
 
-  * Exophase's page is frozen between its own refreshes, so consecutive
-    reads with identical (players, rates) carry no new information. Only
-    the segment ends -- one observation per refresh -- are used.
-  * Players N(t): log N is fit against log hours since the NZ unlock
-    (quadratic with >= 3 refresh points, linear with 2, and a fixed
-    launch-calibrated prior curve with fewer). Inside the observed range
-    the fit is used as-is; beyond it the curve continues as a power law
-    with the last secant slope, damped by 0.45: the raw quadratic's end
-    derivative badly undershoots growth, while the raw last secant
-    overshoots wildly. A raw quadratic is never extrapolated as one.
-  * Holders H_t(t): across refreshes, per trophy,
-        dH = a_t * dN + b_t * dt * N_prev
-    (a_t = the new cohort's holding probability for this trophy,
-    b_t = the per-player-per-hour earn rate among existing players).
-    Only a_t is estimated per trophy, by a single-regressor ridge
-    toward the earliness prior, with b_t held at the pooled prior:
-    the two regressors correlate at ~0.99, so a two-regressor fit
-    swings b by an order of magnitude on a modest pull of a. The
-    forecast base term uses the incumbent N_last, not the average of
-    N_last and N_target: newcomers over the horizon are already
-    counted by the a term.
-    With fewer than 2 refresh points there is no regression to run, so
-    the prior is used directly: a_t = last_rate * earliness(t), where
-    earliness is read off the trophy text (chapter number, activity
-    keywords) and calibrated to the measured launch-to-now cohort
-    profile. b_t's prior is a small pooled value.
-  * The median rate is H_target / N_target. The fan is a Laplace fan on
-    the logit scale with a fat lower tail (dilution risk is one-sided).
-
-Standard library only, offline, deterministic, no randomness.
-Reads MAKEFUN_INPUT_DIR (default /input), writes MAKEFUN_OUTPUT_DIR
-(default /output), one <case id>.out per <case id>.in.
+I/O: reads every *.in in $MAKEFUN_INPUT_DIR (else /input), writes
+<id>.out to $MAKEFUN_OUTPUT_DIR (else /output) as
+{"trophies": [{"id": n, "q": [q05, q25, q50, q75, q95]}]}.
 """
 
+import glob
 import json
 import math
 import os
-import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-# New Zealand unlock, the start of the launch clock.
-RELEASE = datetime(2026, 11, 18, 11, 0, 0, tzinfo=timezone.utc)
-
-# Launch-calibrated prior growth curve: (hours since release, players).
-# Three known refresh points: 638 @ 12.8 h, 3,868 @ 17.5 h, ~13,500 @ 28.3 h.
-PRIOR_GROWTH = ((12.833333, 638.0), (17.5, 3868.0), (28.3, 13500.0))
-
-# Standard-normal quantiles for the five levels 0.05/0.25/0.5/0.75/0.95.
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
-# Fan widths per quantile: fat lower tail, narrow upper tail.
-FAN_WIDTHS = (1.3, 0.9, 1.0, 0.9, 0.7)
+FAN_WIDTHS = (1.3, 0.9, 0.0, 0.9, 0.7)
 
-# Prior per-player-per-hour earn rate among existing players.
-# 2e-5: the value the launch -> now totals support when the b term is
-# based on the incumbent N_last (see holder_model). An earlier draft
-# cut it to 5e-6 while the b term wrongly used the average of N_last
-# and N_target, which inflated the b term 4-11x; with the base fixed,
-# 2e-5 is right on both checks (backtest and smoke).
-B_PRIOR = 2e-5
-
-CHAPTER_EARLINESS = {1: 0.56, 2: 0.08, 3: 0.02, 4: 0.01}
-TIER_EARLINESS = {"bronze": 0.02, "silver": 0.005, "gold": 0.002,
-                  "platinum": 0.0}
-# Wide-fan median rates (percent) when a case carries no history at all.
-TIER_PRIOR_RATE = {"bronze": 0.8, "silver": 0.8, "gold": 0.5,
-                   "platinum": 0.3}
+# New Zealand unlock, when the first players could earn trophies.
+UNLOCK = datetime(2026, 11, 18, 11, 0, 0, tzinfo=timezone.utc)
+# Launch-calibrated player counts: (hours since unlock, players tracked).
+ANCHOR_POINTS = ((12.83, 638.0), (17.5, 3868.0), (28.3, 13500.0))
+# Pooled per-player-per-hour earn rate among existing players, by tier.
+BASE_EARN_PRIOR = {
+    "platinum": 0.000002,
+    "gold": 0.000005,
+    "silver": 0.000005,
+    "bronze": 0.00001,
+}
+# Last-resort median rate (percent) when a trophy was never observed.
+TIER_FALLBACK_MEDIAN = {
+    "platinum": 0.10,
+    "gold": 0.50,
+    "silver": 0.80,
+    "bronze": 1.00,
+}
 
 
 def parse_time(text):
-    """Parse an ISO-8601 timestamp (trailing Z allowed) to aware UTC."""
-    if text is None:
-        return None
-    dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    """ISO-8601 with Z or offset, with or without fractional seconds."""
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
 
-def hours_since_release(moment):
-    return max((moment - RELEASE).total_seconds() / 3600.0, 0.05)
+def hours_since_unlock(moment):
+    return max((moment - UNLOCK).total_seconds() / 3600.0, 0.1)
 
 
-def logit(pct):
-    p = min(max(pct, 0.01), 99.99) / 100.0
+def clamp_rate(pct):
+    return min(max(pct, 0.01), 99.99)
+
+
+def logit_pct(pct):
+    p = clamp_rate(pct) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def inv_logit(x):
-    if x >= 0:
-        return 100.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return 100.0 * e / (1.0 + e)
+def inv_logit_pct(x):
+    return 1.0 / (1.0 + math.exp(-x)) * 100.0
 
 
-def clamp(value, lo, hi):
-    return lo if value < lo else hi if value > hi else value
-
-
-def solve_linear(matrix, vector):
-    """Small dense Gaussian elimination with partial pivoting."""
-    n = len(vector)
-    rows = [row[:] + [vector[i]] for i, row in enumerate(matrix)]
+def solve_linear(matrix, rhs):
+    """Gaussian elimination with partial pivoting; returns None if singular."""
+    n = len(rhs)
+    aug = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
     for col in range(n):
-        piv = max(range(col, n), key=lambda r: abs(rows[r][col]))
-        if abs(rows[piv][col]) < 1e-12:
+        piv = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[piv][col]) < 1e-12:
             return None
-        rows[col], rows[piv] = rows[piv], rows[col]
-        for r in range(n):
-            if r != col:
-                factor = rows[r][col] / rows[col][col]
-                for k in range(col, n + 1):
-                    rows[r][k] -= factor * rows[col][k]
-    return [rows[i][n] / rows[i][i] for i in range(n)]
+        aug[col], aug[piv] = aug[piv], aug[col]
+        for r in range(col + 1, n):
+            factor = aug[r][col] / aug[col][col]
+            for c in range(col, n + 1):
+                aug[r][c] -= factor * aug[col][c]
+    out = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        out[i] = (aug[i][n] - sum(aug[i][j] * out[j] for j in range(i + 1, n))
+                  ) / aug[i][i]
+    return out
 
 
 def polyfit(xs, ys, degree):
-    """Least-squares polynomial fit; returns coefficients low to high."""
-    n = degree + 1
-    matrix = [[sum(x ** (i + j) for x in xs) for j in range(n)]
-              for i in range(n)]
-    vector = [sum(y * x ** i for x, y in zip(xs, ys)) for i in range(n)]
-    coef = solve_linear(matrix, vector)
-    if coef is None:
-        return None
-    return coef
+    """Least-squares polynomial (coefficients low to high degree)."""
+    m = degree + 1
+    matrix = [[sum(x ** (i + j) for x in xs) for j in range(m)]
+              for i in range(m)]
+    rhs = [sum(y * x ** i for x, y in zip(xs, ys)) for i in range(m)]
+    coeffs = solve_linear(matrix, rhs)
+    if coeffs is None:
+        # Degenerate inputs: fall back to the mean.
+        mean_y = sum(ys) / len(ys)
+        return [mean_y] + [0.0] * degree
+    return coeffs
 
 
-def polyval(coef, x):
+def polyval(coeffs, x):
     total = 0.0
-    for c in reversed(coef):
+    for c in reversed(coeffs):
         total = total * x + c
     return total
 
 
-def polyderiv(coef, x):
-    total = 0.0
-    for power in range(len(coef) - 1, 0, -1):
-        total = total * x + power * coef[power]
-    return total
-
-
 def earliness(trophy):
-    """How early a trophy sits in the game, from its text.
+    """How early a trophy is, as a factor on its last rate.
 
-    Returns a factor in [0, 1]: the share of the launch rate that a fresh
-    cohort of players is expected to hold. Early story/activity trophies
-    score high; late and completionist ones score near zero.
+    Calibrated on the launch -> 19 Nov new-cohort profile: a fresh player
+    holds the intro trophy and a few early ones and almost nothing late,
+    so the factor tracks chapter number and activity, not the rate level.
+    A trophy's prior new-cohort holding probability is last rate x this.
     """
-    tid = trophy.get("id")
-    if tid == 2:  # "Just Like Paradise": every new player earns it.
-        return 1.0
-    tier = str(trophy.get("tier", "bronze")).lower()
+    text = (trophy.get("name", "") + " " + trophy.get("description", "")).lower()
+    tier = trophy.get("tier", "bronze")
     if tier == "platinum":
         return 0.0
-    text = ((trophy.get("name") or "") + " " +
-            (trophy.get("description") or "")).lower()
-    match = re.search(r"chapter\s+(\d+)", text)
-    if match:
-        return CHAPTER_EARLINESS.get(int(match.group(1)), 0.005)
-    if "complete the final mission." in text:
-        return 0.005
-    if "100% completion" in text:
-        return 0.001
+    if "gone fishing" in text:
+        return 1.0
+    if "chapter 1" in text:
+        return 0.56
+    if "chapter 2" in text:
+        return 0.08
+    if "chapter 3" in text or "chapter 4" in text:
+        return 0.01
+    if "final mission" in text or "100% completion" in text:
+        return 0.01
     if "fishing" in text:
-        return 0.92
+        return 0.90
     if "arcade" in text:
         return 0.40
     if "breakfast run" in text:
         return 0.18
     if "discover 100 vehicles" in text:
         return 0.15
-    if "try each type of activity once" in text:
-        return 0.01
-    if "top fun" in text:
-        return 0.01
-    if any(key in text for key in ("250 stunts", "gold medal",
-                                   "100 locations", "50 challenges",
-                                   "collectible card", "mission strands")):
-        return 0.005
-    return TIER_EARLINESS.get(tier, 0.02)
+    if "unscheduled departure" in text:
+        return 0.11
+    if "what the hell" in text:
+        return 0.10
+    if "melee drive-by" in text:
+        return 0.03
+    if "bowling" in text or "bowl " in text:
+        return 0.07
+    if "wanted level" in text:
+        return 0.05
+    if "rhino" in text:
+        return 0.04
+    if "cocktail" in text:
+        return 0.04
+    if "combat focus" in text:
+        return 0.03
+    if "jewelry store" in text or "gold medal" in text:
+        return 0.02
+    return 0.005
 
 
 def refresh_points(history, n_trophies):
-    """Collapse reads into one observation per Exophase refresh.
+    """Collapse frozen reads into refresh observations.
 
-    Consecutive reads with identical (players_tracked, rates) are one
-    frozen page; only the last read of each run carries information.
-    Returns [(time, players, holders)] with holders as fractions of
-    players (None where a rate was missing).
+    Returns [(time, players_tracked, [rate or None per trophy]), ...].
     """
     points = []
     prev_key = None
     for read in history or []:
-        players = read.get("players_tracked")
-        rates = read.get("rates") or []
-        if players is None or players <= 0:
+        rates = list(read.get("rates") or [])
+        rates += [None] * (n_trophies - len(rates))
+        key = (read.get("players_tracked"), tuple(rates))
+        if key == prev_key:
             continue
-        rates = list(rates) + [None] * max(0, n_trophies - len(rates))
-        key = (players, tuple(rates[:n_trophies]))
-        moment = parse_time(read.get("at") or read.get("slot"))
-        if moment is None:
-            continue
-        holders = [None if r is None else float(r) / 100.0 * players
-                   for r in rates[:n_trophies]]
-        if key == prev_key and points:
-            points[-1] = (moment, players, holders)
-        else:
-            points.append((moment, players, holders))
         prev_key = key
+        points.append((parse_time(read["at"]), read.get("players_tracked"),
+                       rates[:n_trophies]))
     return points
 
 
-def forecast_players(points, target, n_last):
-    """Forecast players tracked at the target. Returns (N_target, sig_n).
+def forecast_players(points, target, last_n):
+    """Forecast players tracked at target; returns (N_target, sigma).
 
-    sig_n is the log-scale uncertainty of the N forecast, used to widen
-    the rate fan.
+    Log N against log hours since unlock. A quadratic fits the observed
+    range; beyond it, extrapolate as a power law whose exponent is the
+    last log-log slope damped by 0.45 (a player count cannot turn down).
+    Sigma grows with how far past the last observation the target sits.
     """
     if len(points) >= 2:
-        xs = [math.log(hours_since_release(t)) for t, _, _ in points]
-        ys = [math.log(n) for _, n, _ in points]
-        degree = 2 if len(points) >= 3 else 1
-        coef = polyfit(xs, ys, degree)
-        if coef is None:
-            coef = polyfit(xs, ys, 1)
-        if coef is None:
-            return float(n_last), 0.35
-        resid = math.sqrt(sum((y - polyval(coef, x)) ** 2
-                              for x, y in zip(xs, ys)) / len(xs))
-        sig = clamp(0.10 + 2.0 * resid, 0.10, 0.60) if len(points) >= 3 \
-            else 0.30
+        # Refresh points carry rates too; the player fit needs (time, N).
+        series = [(moment, players) for moment, players, _ in points]
     else:
-        xs = [math.log(h) for h, _ in PRIOR_GROWTH]
-        ys = [math.log(n) for _, n in PRIOR_GROWTH]
-        coef = polyfit(xs, ys, 2)
-        if coef is None:
-            return float(n_last), 0.35
-        sig = 0.35
-    x_target = math.log(hours_since_release(target))
-    x_max = max(xs)
-    if x_target <= x_max:
-        log_n = polyval(coef, x_target)
+        series = [(UNLOCK + timedelta(hours=h), n) for h, n in ANCHOR_POINTS]
+    xs = [math.log(hours_since_unlock(t)) for t, _ in series]
+    ys = [math.log(n) for _, n in series]
+    degree = 2 if len(series) >= 3 else 1
+    coeffs = polyfit(xs, ys, degree)
+    x_target = math.log(hours_since_unlock(target))
+    x_last, y_last = xs[-1], ys[-1]
+    if x_target <= x_last:
+        log_n = polyval(coeffs, x_target)
+        past_h = 0.0
     else:
-        # Power-law continuation with the last secant slope, damped:
-        # the fitted log-log quadratic is strongly concave, so its end
-        # derivative badly undershoots growth (smoke: 84k vs 110k),
-        # while the raw last secant (2.6) overshoots wildly (1.9M).
-        # The damped secant (x0.45) lands the smoke N at +6% and is
-        # the growth rate the launch anchor implies for the late window.
-        if len(xs) >= 2:
-            secant = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
-        else:
-            secant = polyderiv(coef, x_max)
-        slope = clamp(0.45 * secant, 0.05, 2.0)
-        log_n = polyval(coef, x_max) + slope * (x_target - x_max)
-    n_target = clamp(math.exp(log_n), float(n_last), 5_000_000.0)
-    return n_target, sig
+        # Beyond the range, grow as a power law from the last point,
+        # with the most recent log-log slope (last secant) damped by
+        # 0.45: the fitted quadratic is concave and would turn down if
+        # extrapolated, but the player count keeps growing.
+        slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+        exponent = min(max(0.45 * slope, 0.25), 1.5)
+        log_n = y_last + exponent * (x_target - x_last)
+        past_h = (target - series[-1][0]).total_seconds() / 3600.0
+    sigma = min(max(0.10 + 0.05 * math.sqrt(max(past_h, 0.0) / 24.0),
+                    0.10), 0.60)
+    # Floor at the last observed count; cap growth at 40x the larger of
+    # the case's last count and the fit's last anchor (the prior path's
+    # anchors run ahead of a short case history).
+    cap = max(last_n, math.exp(y_last)) * 40.0
+    n_target = math.exp(min(max(log_n, math.log(last_n)), math.log(cap)))
+    return n_target, sigma
 
 
-def holder_model(points, trophies, last_rates):
-    """Per-trophy (a, b, resid) for the holder dynamics.
+def holder_prior(trophy, last_rate_pct):
+    """Prior (a0, b0) for the holder regression of one trophy."""
+    if last_rate_pct is None:
+        last_rate_pct = TIER_FALLBACK_MEDIAN.get(trophy.get("tier"), 1.0)
+    a0 = (last_rate_pct / 100.0) * earliness(trophy)
+    b0 = BASE_EARN_PRIOR.get(trophy.get("tier", "bronze"), 0.00001)
+    return a0, b0
 
-    a = new cohort's holding probability, b = per-player-per-hour earn
-    rate among existing players, resid = relative regression residual
-    (0 when the prior is used directly).
 
-    Only a is estimated per trophy, by a single-regressor ridge toward
-    the earliness prior, with b held at the pooled prior. The textbook
-    two-regressor fit (a on dN, b on dt * N_prev) is unusable here: the
-    two regressors correlate at ~0.99, so a modest pull on a swings the
-    fitted b by an order of magnitude, and the forecast horizon's
-    (dt * N) / dN ratio is 12-100x the observed intervals', so a b
-    error explodes in the forecast. Measured on the multi-refresh smoke
-    test: the two-regressor version scored loss 0.93 with medians ~3x
-    the truth; the single-regressor version fixes that. b is anchored
-    to the pooled prior because the launch -> now totals imply the
-    pooled existing-player earn rate is near zero.
+def fit_holders(transitions, a0, b0):
+    """Least-squares dH = a*dN + b*dt*N_prev through the origin.
+
+    Returns (a, b, rms) with the fit shrunk toward the prior: the more
+    transitions observed, the more the data is trusted. Falls back to
+    the prior when the system is singular.
     """
-    n = len(trophies)
-    priors = []
-    for i, trophy in enumerate(trophies):
-        last = last_rates[i]
-        base = (last / 100.0) if last is not None else 0.008
-        priors.append(clamp(base * earliness(trophy), 0.0, 1.0))
-    if len(points) < 2:
-        return [(priors[i], B_PRIOR, 0.0) for i in range(n)]
-
-    intervals = []
-    for k in range(1, len(points)):
-        t_prev, n_prev, h_prev = points[k - 1]
-        t_cur, n_cur, h_cur = points[k]
-        dt = max((t_cur - t_prev).total_seconds() / 3600.0, 0.0)
-        intervals.append((n_cur - n_prev, dt, n_prev, h_prev, h_cur))
-
-    results = []
-    for i in range(n):
-        s_dd = 0.0
-        s_dy = 0.0
-        usable = 0
-        for dn, dt, n_prev, h_prev, h_cur in intervals:
-            if h_prev[i] is None or h_cur[i] is None:
-                continue
-            # Holders the pooled b term already explains in this interval.
-            dh = (h_cur[i] - h_prev[i]) - B_PRIOR * dt * n_prev
-            s_dd += dn * dn
-            s_dy += dn * dh
-            usable += 1
-        if usable == 0 or s_dd <= 0:
-            results.append((priors[i], B_PRIOR, 0.0))
-            continue
-        lam = 0.25 * s_dd
-        a = clamp((s_dy + lam * priors[i]) / (s_dd + lam), 0.0, 1.0)
-        h_last = points[-1][2][i]
-        scale = max(h_last if h_last is not None else 0.0, 1.0)
-        sq = 0.0
-        for dn, dt, n_prev, h_prev, h_cur in intervals:
-            if h_prev[i] is None or h_cur[i] is None:
-                continue
-            pred = a * dn + B_PRIOR * dt * n_prev
-            sq += (pred - (h_cur[i] - h_prev[i])) ** 2
-        resid = clamp(math.sqrt(sq / usable) / scale, 0.0, 0.3)
-        results.append((a, B_PRIOR, resid))
-    return results
+    saa = sum(d * d for d, _, _ in transitions)
+    sab = sum(d * u for d, u, _ in transitions)
+    sbb = sum(u * u for _, u, _ in transitions)
+    ta = sum(d * h for d, _, h in transitions)
+    tb = sum(u * h for _, u, h in transitions)
+    det = saa * sbb - sab * sab
+    if abs(det) <= 1e-12 * max(saa * sbb, 1.0):
+        return a0, b0, 0.0
+    a_ols = (ta * sbb - tb * sab) / det
+    b_ols = (tb * saa - ta * sab) / det
+    weight = len(transitions) / (len(transitions) + 1.0)
+    a = max(weight * a_ols + (1.0 - weight) * a0, 0.0)
+    b = max(weight * b_ols + (1.0 - weight) * b0, 0.0)
+    sq_err = sum((h - (a * d + b * u)) ** 2 for d, u, h in transitions)
+    rms = math.sqrt(sq_err / len(transitions))
+    return a, b, rms
 
 
 def forecast_case(case):
-    """Forecast one case dict; returns the output dict."""
     trophies = case.get("trophies") or []
     n = len(trophies)
-    target = parse_time(case.get("target"))
     points = refresh_points(case.get("history"), n)
-    last_rates = [None] * n
-    if points:
-        _, _, holders = points[-1]
-        n_last = points[-1][1]
-        for i in range(n):
-            if holders[i] is not None:
-                last_rates[i] = holders[i] / n_last * 100.0
+    target = parse_time(case["target"])
+
+    # The graded answer is the state at the last refresh before the
+    # target, so pull the effective target earlier when refreshes are
+    # frequent enough to say how often they land.
+    if len(points) >= 3:
+        gaps = sorted(
+            (points[i][0] - points[i - 1][0]).total_seconds() / 3600.0
+            for i in range(1, len(points)))
+        mid = len(gaps) // 2
+        median_gap = gaps[mid] if len(gaps) % 2 == 1 else \
+            0.5 * (gaps[mid - 1] + gaps[mid])
+        target_eff = target - timedelta(hours=min(0.5 * median_gap, 6.0))
     else:
-        n_last = 0
+        target_eff = target
 
-    if not points or target is None:
+    if not points:
         rows = []
-        for i, trophy in enumerate(trophies):
-            tier = str(trophy.get("tier", "bronze")).lower()
-            med = 99.99 if trophy.get("id") == 2 else \
-                TIER_PRIOR_RATE.get(tier, 0.8)
-            rows.append((trophy.get("id", i + 1), med, 1.2))
-    else:
-        n_target, sig_n = forecast_players(points, target, n_last)
-        last_time = points[-1][0]
-        horizon_h = max((target - last_time).total_seconds() / 3600.0, 0.0)
-        model = holder_model(points, trophies, last_rates)
-        base_spread = 0.45 if len(points) < 2 else \
-            0.40 if len(points) == 2 else 0.35
-        rows = []
-        for i, trophy in enumerate(trophies):
-            a, b, resid = model[i]
-            _, _, holders = points[-1]
-            h_last = holders[i]
-            if h_last is None:
-                h_last = (last_rates[i] or 0.8) / 100.0 * n_last
-            h_target = h_last + a * (n_target - n_last) + \
-                b * horizon_h * n_last
-            # The b term uses the incumbent base N_last, not the average
-            # of N_last and N_target: newcomers over the horizon are
-            # already counted by the a term, so counting them in b too
-            # double-counts their earning. Measured on the real-data
-            # backtest (0.1197 -> 0.0975 with the average-N version as
-            # the baseline) and on the smoke test.
-            h_target = clamp(h_target, h_last, n_target)
-            med = h_target / n_target * 100.0
-            if last_rates[i] is not None and last_rates[i] >= 99.99:
-                med = 99.99
-            med = clamp(med, 0.01, 99.99)
-            spread = clamp(base_spread + 0.4 * sig_n + resid, 0.25, 1.2)
-            rows.append((trophy.get("id", i + 1), med, spread))
+        for trophy in trophies:
+            median = TIER_FALLBACK_MEDIAN.get(trophy.get("tier"), 1.0)
+            rows.append({"id": trophy["id"],
+                         "q": fan_rows(median, 1.2)})
+        rows.sort(key=lambda r: r["id"])
+        return {"trophies": rows}
 
-    out_trophies = []
-    for tid, med, spread in rows:
-        center = logit(med)
-        quantiles = []
-        for z, width in zip(Z_SCORES, FAN_WIDTHS):
-            q = inv_logit(center + z * width * spread)
-            quantiles.append(round(clamp(q, 0.01, 99.99), 4))
-        for j in range(1, 5):
-            if quantiles[j] < quantiles[j - 1]:
-                quantiles[j] = quantiles[j - 1]
-        out_trophies.append({"id": tid, "q": quantiles})
-    out_trophies.sort(key=lambda r: r["id"])
-    return {"trophies": out_trophies}
+    last_t, last_n, _ = points[-1]
+    n_target, sig_n = forecast_players(points, target_eff, last_n)
+
+    rows = []
+    for idx, trophy in enumerate(trophies):
+        # This trophy's own observed (time, players, holders) series.
+        series = []
+        for moment, players, rates in points:
+            rate = rates[idx] if idx < len(rates) else None
+            if rate is None or players is None:
+                continue
+            series.append((moment, players, rate / 100.0 * players))
+        if not series:
+            median = TIER_FALLBACK_MEDIAN.get(trophy.get("tier"), 1.0)
+            rows.append({"id": trophy["id"],
+                         "q": fan_rows(median, 1.2)})
+            continue
+        base_t, base_n, base_h = series[-1]
+        last_rate = base_h / base_n * 100.0 if base_n else None
+        a0, b0 = holder_prior(trophy, last_rate)
+        transitions = []
+        for j in range(1, len(series)):
+            t0, n0, h0 = series[j - 1]
+            t1, n1, h1 = series[j]
+            dt_h = (t1 - t0).total_seconds() / 3600.0
+            transitions.append((n1 - n0, dt_h * n0, h1 - h0))
+        if len(transitions) >= 2:
+            a, b, rms = fit_holders(transitions, a0, b0)
+            spread_h = 0.30 + min(rms / max(base_h, 1.0), 0.5)
+        else:
+            a, b = a0, b0
+            spread_h = 0.55
+        horizon_h = max((target_eff - base_t).total_seconds() / 3600.0, 0.0)
+        # The base's earn rate b applies to the incumbent base that was
+        # measured (base_n), not to a growing average: newcomers over
+        # the horizon are already counted by the a-term, and counting
+        # them in b too would double-count their earning.
+        holders = base_h + a * (n_target - base_n) \
+            + b * horizon_h * base_n
+        holders = max(holders, 0.0)
+        median = clamp_rate(holders / n_target * 100.0) if n_target > 0 \
+            else last_rate or 1.0
+        # A log error in players shifts every log rate by the same
+        # amount, so the players uncertainty enters one-for-one.
+        spread = 0.8 * math.sqrt(spread_h ** 2 + sig_n ** 2 + 0.10 ** 2)
+        spread = min(max(spread, 0.25), 1.2)
+        rows.append({"id": trophy["id"],
+                     "q": fan_rows(median, spread)})
+    rows.sort(key=lambda r: r["id"])
+    return {"trophies": rows}
 
 
-def main(argv=None):
+def fan_rows(median, spread):
+    """Laplace quantiles on the logit scale; fat lower tail, 4 decimals."""
+    centre = logit_pct(median)
+    out = []
+    for z, width in zip(Z_SCORES, FAN_WIDTHS):
+        q = clamp_rate(inv_logit_pct(centre + z * width * spread))
+        out.append(round(q, 4))
+    for k in range(1, 5):
+        if out[k] < out[k - 1]:
+            out[k] = out[k - 1]
+    return out
+
+
+def main():
     in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
     out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
     os.makedirs(out_dir, exist_ok=True)
-    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
-    if not names:
-        print("no .in files in %s" % in_dir, file=sys.stderr)
-        return 1
-    for name in names:
-        with open(os.path.join(in_dir, name)) as fh:
+    for in_path in sorted(glob.glob(os.path.join(in_dir, "*.in"))):
+        with open(in_path) as fh:
             case = json.load(fh)
         result = forecast_case(case)
-        stem = case.get("id") or name[:-3]
-        with open(os.path.join(out_dir, stem + ".out"), "w") as fh:
-            json.dump(result, fh, indent=2)
+        out_path = os.path.join(out_dir, case["id"] + ".out")
+        with open(out_path, "w") as fh:
+            json.dump(result, fh, separators=(",", ":"))
             fh.write("\n")
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
