@@ -17,14 +17,20 @@ Model (see work/DESIGN.md for the evidence behind it):
     (quadratic with >= 3 refresh points, linear with 2, and a fixed
     launch-calibrated prior curve with fewer). Inside the observed range
     the fit is used as-is; beyond it the curve continues as a power law
-    with the slope at the last observed point, floored so a player count
-    can never turn down. A raw quadratic collapses at a 7-day horizon,
-    so it is never extrapolated as a quadratic.
+    with the last secant slope, damped by 0.45: the raw quadratic's end
+    derivative badly undershoots growth, while the raw last secant
+    overshoots wildly. A raw quadratic is never extrapolated as one.
   * Holders H_t(t): across refreshes, per trophy,
         dH = a_t * dN + b_t * dt * N_prev
     (a_t = the new cohort's holding probability for this trophy,
-    b_t = the per-player-per-hour earn rate among existing players),
-    solved through the origin with ridge shrinkage toward a prior.
+    b_t = the per-player-per-hour earn rate among existing players).
+    Only a_t is estimated per trophy, by a single-regressor ridge
+    toward the earliness prior, with b_t held at the pooled prior:
+    the two regressors correlate at ~0.99, so a two-regressor fit
+    swings b by an order of magnitude on a modest pull of a. The
+    forecast base term uses the incumbent N_last, not the average of
+    N_last and N_target: newcomers over the horizon are already
+    counted by the a term.
     With fewer than 2 refresh points there is no regression to run, so
     the prior is used directly: a_t = last_rate * earliness(t), where
     earliness is read off the trophy text (chapter number, activity
@@ -58,11 +64,12 @@ Z_SCORES = (-1.645, -0.674, 0.0, 0.674, 1.645)
 FAN_WIDTHS = (1.3, 0.9, 1.0, 0.9, 0.7)
 
 # Prior per-player-per-hour earn rate among existing players.
-# Kept small on purpose: the launch -> now totals imply the pooled
-# existing-player earn rate is near zero (new holders are almost all
-# explained by the new cohort), and the b term is the fragile half of
-# the holder model (see holder_model).
-B_PRIOR = 5e-6
+# 2e-5: the value the launch -> now totals support when the b term is
+# based on the incumbent N_last (see holder_model). An earlier draft
+# cut it to 5e-6 while the b term wrongly used the average of N_last
+# and N_target, which inflated the b term 4-11x; with the base fixed,
+# 2e-5 is right on both checks (backtest and smoke).
+B_PRIOR = 2e-5
 
 CHAPTER_EARLINESS = {1: 0.56, 2: 0.08, 3: 0.02, 4: 0.01}
 TIER_EARLINESS = {"bronze": 0.02, "silver": 0.005, "gold": 0.002,
@@ -247,9 +254,17 @@ def forecast_players(points, target, n_last):
     if x_target <= x_max:
         log_n = polyval(coef, x_target)
     else:
-        # Power-law continuation with the slope at the last observed
-        # point: counts keep growing, but never accelerate upward.
-        slope = clamp(polyderiv(coef, x_max), 0.05, 2.0)
+        # Power-law continuation with the last secant slope, damped:
+        # the fitted log-log quadratic is strongly concave, so its end
+        # derivative badly undershoots growth (smoke: 84k vs 110k),
+        # while the raw last secant (2.6) overshoots wildly (1.9M).
+        # The damped secant (x0.45) lands the smoke N at +6% and is
+        # the growth rate the launch anchor implies for the late window.
+        if len(xs) >= 2:
+            secant = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+        else:
+            secant = polyderiv(coef, x_max)
+        slope = clamp(0.45 * secant, 0.05, 2.0)
         log_n = polyval(coef, x_max) + slope * (x_target - x_max)
     n_target = clamp(math.exp(log_n), float(n_last), 5_000_000.0)
     return n_target, sig
@@ -359,7 +374,13 @@ def forecast_case(case):
             if h_last is None:
                 h_last = (last_rates[i] or 0.8) / 100.0 * n_last
             h_target = h_last + a * (n_target - n_last) + \
-                b * horizon_h * (n_last + n_target) / 2.0
+                b * horizon_h * n_last
+            # The b term uses the incumbent base N_last, not the average
+            # of N_last and N_target: newcomers over the horizon are
+            # already counted by the a term, so counting them in b too
+            # double-counts their earning. Measured on the real-data
+            # backtest (0.1197 -> 0.0975 with the average-N version as
+            # the baseline) and on the smoke test.
             h_target = clamp(h_target, h_last, n_target)
             med = h_target / n_target * 100.0
             if last_rates[i] is not None and last_rates[i] >= 99.99:
